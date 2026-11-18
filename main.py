@@ -1,87 +1,87 @@
-"""cbBTC/USDC 1-minute bars bot: deep-dip mean reversion (make.fun bars-replay/v1).
+"""cbBTC deep-dip mean-reversion bot for make.fun btc-race-24h (agent-fun/bars-replay/v1).
 
-Deterministic long-only strategy, single asset, one position:
-- Keep a rolling window of closes; compute the z-score of the latest close.
-- Enter only on deep dislocations (z <= Z_ENTRY) with size scaled by conviction.
-- Exit on reversion (z back toward mean and PnL over fees), on stop-loss, or
-  on a time stop. Fees are 4 bps + 2 bps slippage + impact: a round trip costs
-  ~10 bps, so trades are rare and only on strong signals.
-- No clock, no environment, no randomness: identical input, identical orders.
+Long-only, single asset (CBBTC), at most one position. Each batch appends CBBTC's
+close to a rolling history; once WINDOW closes exist, the latest close is scored
+as a z-score against that window. A dip to z <= -3.0 buys (all cash when
+z <= -3.6, else cash*4//10), and the trigger then disarms until z recovers past
+the hysteresis band (-2.25), so one dip is bought once, not on every bar of it.
+The position exits on a -250 bps stop, a 60-bar time stop (counted from the fill
+bar, since orders decided on bar k fill at bar k+1's open), or +10 bps of profit
+once price has reverted to z >= -0.5.
+
+Determinism: every entry runs twice and the two action logs must match byte for
+byte, so the bot is a pure function of the stdin bar stream — no clock, no
+environment, no random. All money math is integer (Python ints; the z-score
+uses one float division, IEEE-deterministic), so both runs agree exactly.
 """
+
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars  # noqa: E402
 
-WINDOW = 360        # rolling window for the z-score
-Z_ENTRY = 3.0       # enter when the price is this far below the mean
-Z_EXIT = -0.5       # reversion level at which profit exits unlock
-STOP_BPS = 250      # stop-loss from entry
-MAX_HOLD = 60       # time stop (bars)
-PROFIT_BPS = 10     # minimum profit to take
-SIZE_FULL_Z = 3.6   # conviction level for a full-position buy
-SIZE_PCT = 4        # base buy size, tenths of cash
+import makefun_bars
+
+SYMBOL = "CBBTC"
+WINDOW = 360
+Z_ENTRY = -3.0
+Z_DEEP = -3.6
+Z_HYSTERESIS = -2.25
+Z_PROFIT = -0.5
+STOP_BPS = -250
+PROFIT_BPS = 10
+TIME_STOP_BARS = 60
+MIN_SPEND = 2_000_000
+SLIPPAGE_BPS = 200
 
 
-def zscore(w, close):
-    mean = sum(w) / len(w)
-    var = sum((v - mean) ** 2 for v in w) / len(w)
-    std = var ** 0.5
-    return ((close - mean) / std) if std > 0 else 0.0
+def zscore(window, close):
+    """(close - mean) / std over window (population variance); 0.0 when std == 0."""
+    mean = sum(window) // len(window)
+    var = sum((c - mean) ** 2 for c in window) // len(window)
+    std = math.isqrt(var)
+    if std == 0:
+        return 0.0
+    return (close - mean) / std
 
 
 def on_batch(state, batch):
-    sym = "CBBTC"
-    bars = [b for b in batch["bars"] if b["symbol"] == sym]
-    if not bars:
-        return []
-    close = int(bars[0]["c"])
-
+    """Decide this batch's orders: None, one buy, or one sell."""
     hist = getattr(state, "_closes", None)
     if hist is None:
         hist = state._closes = []
-    hist.append(close)
+    for bar in batch["bars"]:
+        if bar["symbol"] == SYMBOL:
+            hist.append(int(bar["c"]))
 
+    if len(hist) < WINDOW:
+        return None
+
+    window = hist[-WINDOW:]
+    z = zscore(window, window[-1])
+
+    # Hysteresis: once disarmed, re-arm only after the dip has recovered.
+    if not getattr(state, "_armed", True) and z > Z_HYSTERESIS:
+        state._armed = True
+
+    pos = state.positions.get(SYMBOL)
+    if pos is not None:
+        pnl_bps = (state.value(SYMBOL, pos.qty) - pos.cost) * 10000 // max(1, pos.cost)
+        held = batch["seq"] - getattr(state, "_entry_seq", batch["seq"])
+        if pnl_bps <= STOP_BPS or held >= TIME_STOP_BARS or (pnl_bps >= PROFIT_BPS and z >= Z_PROFIT):
+            return [{"side": "sell", "symbol": SYMBOL, "qty": pos.qty, "max_slippage_bps": SLIPPAGE_BPS}]
+        return None
+
+    if state.warming_up or not getattr(state, "_armed", True) or z > Z_ENTRY:
+        return None
+
+    spend = state.cash if z <= Z_DEEP else state.cash * 4 // 10
     orders = []
-    pos = state.positions.get(sym)
-
-    if pos is None:
-        if state.warming_up or len(hist) < WINDOW:
-            return []
-        z = zscore(hist[-WINDOW:], close)
-        armed = getattr(state, "_armed", True)
-        if not armed and z > Z_ENTRY + 0.75:
-            state._armed = True
-            armed = True
-        if armed and z <= Z_ENTRY:
-            spend = state.cash if z <= -SIZE_FULL_Z else state.cash * SIZE_PCT // 10
-            if spend > 2_000_000:
-                orders.append({
-                    "side": "buy", "symbol": sym,
-                    "notional_quote_units": spend,
-                    "max_slippage_bps": 200,
-                })
-                state._entry_seq = batch["seq"] + 1
-                state._armed = False
-        return orders
-
-    entry_seq = getattr(state, "_entry_seq", batch["seq"])
-    held = batch["seq"] - entry_seq
-    qty = pos.qty
-    cost = pos.cost
-    val = state.value(sym, qty)
-    pnl_bps = (val - cost) * 10000 // max(1, cost)
-
-    exit_now = pnl_bps <= -STOP_BPS or held >= MAX_HOLD
-    if not exit_now and pnl_bps >= PROFIT_BPS:
-        exit_now = zscore(hist[-WINDOW:], close) >= Z_EXIT
-    if exit_now:
-        orders.append({
-            "side": "sell", "symbol": sym,
-            "qty": qty,
-            "max_slippage_bps": 200,
-        })
+    if spend > MIN_SPEND:
+        orders.append({"side": "buy", "symbol": SYMBOL, "notional_quote_units": spend, "max_slippage_bps": SLIPPAGE_BPS})
+    state._entry_seq = batch["seq"] + 1
+    state._armed = False
     return orders
 
 
